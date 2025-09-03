@@ -40,4 +40,20 @@ int NI_GeometricTransform(PyArrayObject*, int (*)(npy_intp*, double*, int, int,
 int NI_ZoomShift(PyArrayObject*, PyArrayObject*, PyArrayObject*,
                                  PyArrayObject*, int, int, double, int, int);
 
+/* AVX2 optimized functions */
+#ifdef __AVX2__
+int NI_GeometricTransform_2D_bilinear_f64_avx2(PyArrayObject*, PyArrayObject*,
+                                                const double*, const double*,
+                                                int, int, double);
+int NI_GeometricTransform_2D_bilinear_f32_avx2(PyArrayObject*, PyArrayObject*,
+                                                const double*, const double*,
+                                                int, int, double);
+int NI_GeometricTransform_3D_trilinear_f64_avx2(PyArrayObject*, PyArrayObject*,
+                                                 const double*, const double*,
+                                                 int, int, double);
+int NI_GeometricTransform_3D_trilinear_f32_avx2(PyArrayObject*, PyArrayObject*,
+                                                 const double*, const double*,
+                                                 int, int, double);
+#endif
+
 #endif
