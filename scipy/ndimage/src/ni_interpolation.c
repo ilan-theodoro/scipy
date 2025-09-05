@@ -446,9 +446,10 @@ static int NI_GeometricTransform_2D_bilinear_f32_simd(
                                     (float)(ox+2), (float)(ox+3));
             
             /* Compute source coordinates using affine transform (matrix * [oy, ox]) */
-            __m128 xs = _mm_add_ps(_mm_mul_ps(_mm_set1_ps(m01), vx),
+            /* Fix coordinate swap: xs should be column, ys should be row */
+            __m128 ys = _mm_add_ps(_mm_mul_ps(_mm_set1_ps(m01), vx),
                                    _mm_set1_ps(base_x));
-            __m128 ys = _mm_add_ps(_mm_mul_ps(_mm_set1_ps(m11), vx),
+            __m128 xs = _mm_add_ps(_mm_mul_ps(_mm_set1_ps(m11), vx),
                                    _mm_set1_ps(base_y));
             
             /* Floor to get integer coordinates - use SSE2-compatible floor */
@@ -488,30 +489,43 @@ static int NI_GeometricTransform_2D_bilinear_f32_simd(
             
             /* Process each pixel - check bounds and interpolate */
             for (int j = 0; j < 4; j++) {
-                int x = xi_arr[j];
-                int y = yi_arr[j];
+                int x0 = xi_arr[j];
+                int y0 = yi_arr[j];
                 
-                /* Check if we're in the safe interior region */
-                if (x >= 0 && x < W - 1 && y >= 0 && y < H - 1) {
-                    /* Compute linear indices for the 4 corners */
-                    npy_intp idx00 = y * in_stride_y + x * in_stride_x;
-                    npy_intp idx01 = idx00 + in_stride_x;
-                    npy_intp idx10 = idx00 + in_stride_y;
-                    npy_intp idx11 = idx10 + in_stride_x;
-                    
-                    /* Load the 4 corner values */
-                    float v00 = in_data[idx00];
-                    float v01 = in_data[idx01];
-                    float v10 = in_data[idx10];
-                    float v11 = in_data[idx11];
-                    
-                    /* Bilinear interpolation */
-                    result[j] = v00 * w00_arr[j] + v01 * w01_arr[j] +
-                               v10 * w10_arr[j] + v11 * w11_arr[j];
+                /* Check bounds for each of the 4 corners individually */
+                float v00, v01, v10, v11;
+                
+                /* Corner (y0, x0) */
+                if (y0 >= 0 && y0 < H && x0 >= 0 && x0 < W) {
+                    v00 = in_data[y0 * in_stride_y + x0 * in_stride_x];
                 } else {
-                    /* Outside bounds - use cval or call scalar border handler */
-                    result[j] = (float)cval;
+                    v00 = (float)cval;
                 }
+                
+                /* Corner (y0, x0+1) */
+                if (y0 >= 0 && y0 < H && (x0+1) >= 0 && (x0+1) < W) {
+                    v01 = in_data[y0 * in_stride_y + (x0+1) * in_stride_x];
+                } else {
+                    v01 = (float)cval;
+                }
+                
+                /* Corner (y0+1, x0) */
+                if ((y0+1) >= 0 && (y0+1) < H && x0 >= 0 && x0 < W) {
+                    v10 = in_data[(y0+1) * in_stride_y + x0 * in_stride_x];
+                } else {
+                    v10 = (float)cval;
+                }
+                
+                /* Corner (y0+1, x0+1) */
+                if ((y0+1) >= 0 && (y0+1) < H && (x0+1) >= 0 && (x0+1) < W) {
+                    v11 = in_data[(y0+1) * in_stride_y + (x0+1) * in_stride_x];
+                } else {
+                    v11 = (float)cval;
+                }
+                
+                /* Bilinear interpolation */
+                result[j] = v00 * w00_arr[j] + v01 * w01_arr[j] +
+                           v10 * w10_arr[j] + v11 * w11_arr[j];
             }
             
             /* Store results */
@@ -521,34 +535,52 @@ static int NI_GeometricTransform_2D_bilinear_f32_simd(
         
         /* Scalar cleanup for remaining pixels */
         for (; ox < OW; ox++) {
-            float x_src = m01 * (float)ox + base_x;
-            float y_src = m11 * (float)ox + base_y;
+            /* Fix coordinate swap: x_src should be column, y_src should be row */
+            float y_src = m01 * (float)ox + base_x;
+            float x_src = m11 * (float)ox + base_y;
             
             int x0 = (int)floor(x_src);
             int y0 = (int)floor(y_src);
             
-            if (x0 >= 0 && x0 < W - 1 && y0 >= 0 && y0 < H - 1) {
-                float fx = x_src - x0;
-                float fy = y_src - y0;
-                
-                npy_intp idx00 = y0 * in_stride_y + x0 * in_stride_x;
-                npy_intp idx01 = idx00 + in_stride_x;
-                npy_intp idx10 = idx00 + in_stride_y;
-                npy_intp idx11 = idx10 + in_stride_x;
-                
-                float v00 = in_data[idx00];
-                float v01 = in_data[idx01];
-                float v10 = in_data[idx10];
-                float v11 = in_data[idx11];
-                
-                out_row[ox * out_stride_x] = 
-                    v00 * (1 - fx) * (1 - fy) +
-                    v01 * fx * (1 - fy) +
-                    v10 * (1 - fx) * fy +
-                    v11 * fx * fy;
+            float fx = x_src - x0;
+            float fy = y_src - y0;
+            
+            /* Check bounds for each of the 4 corners individually */
+            float v00, v01, v10, v11;
+            
+            /* Corner (y0, x0) */
+            if (y0 >= 0 && y0 < H && x0 >= 0 && x0 < W) {
+                v00 = in_data[y0 * in_stride_y + x0 * in_stride_x];
             } else {
-                out_row[ox * out_stride_x] = (float)cval;
+                v00 = (float)cval;
             }
+            
+            /* Corner (y0, x0+1) */
+            if (y0 >= 0 && y0 < H && (x0+1) >= 0 && (x0+1) < W) {
+                v01 = in_data[y0 * in_stride_y + (x0+1) * in_stride_x];
+            } else {
+                v01 = (float)cval;
+            }
+            
+            /* Corner (y0+1, x0) */
+            if ((y0+1) >= 0 && (y0+1) < H && x0 >= 0 && x0 < W) {
+                v10 = in_data[(y0+1) * in_stride_y + x0 * in_stride_x];
+            } else {
+                v10 = (float)cval;
+            }
+            
+            /* Corner (y0+1, x0+1) */
+            if ((y0+1) >= 0 && (y0+1) < H && (x0+1) >= 0 && (x0+1) < W) {
+                v11 = in_data[(y0+1) * in_stride_y + (x0+1) * in_stride_x];
+            } else {
+                v11 = (float)cval;
+            }
+            
+            out_row[ox * out_stride_x] = 
+                v00 * (1 - fx) * (1 - fy) +
+                v01 * fx * (1 - fy) +
+                v10 * (1 - fx) * fy +
+                v11 * fx * fy;
         }
     }
     
@@ -603,7 +635,7 @@ static int NI_ZoomShift_2D_bilinear_f32_simd(
         float fy = y_src - y0;
         
         /* Skip this row if outside bounds */
-        if (y0 < 0 || y0 >= H - 1) {
+        if (y0 < 0 || y0 >= H) {
             for (npy_intp ox = 0; ox < OW; ox++) {
                 out_row[ox * out_stride_x] = (float)cval;
             }
@@ -634,28 +666,44 @@ static int NI_ZoomShift_2D_bilinear_f32_simd(
             for (int j = 0; j < 4; j++) {
                 int x0 = xi_arr[j];
                 
-                if (x0 >= 0 && x0 < W - 1) {
-                    float fx_val = fx_arr[j];
-                    
-                    /* Load the 4 corner values */
-                    npy_intp idx00 = y0 * in_stride_y + x0 * in_stride_x;
-                    npy_intp idx01 = idx00 + in_stride_x;
-                    npy_intp idx10 = idx00 + in_stride_y;
-                    npy_intp idx11 = idx10 + in_stride_x;
-                    
-                    float v00 = in_data[idx00];
-                    float v01 = in_data[idx01];
-                    float v10 = in_data[idx10];
-                    float v11 = in_data[idx11];
-                    
-                    /* Bilinear interpolation */
-                    result[j] = v00 * (1 - fx_val) * (1 - fy) +
-                               v01 * fx_val * (1 - fy) +
-                               v10 * (1 - fx_val) * fy +
-                               v11 * fx_val * fy;
+                float fx_val = fx_arr[j];
+                
+                /* Check bounds for each of the 4 corners and get values */
+                float v00, v01, v10, v11;
+                
+                /* Corner (y0, x0) */
+                if (y0 >= 0 && y0 < H && x0 >= 0 && x0 < W) {
+                    v00 = in_data[y0 * in_stride_y + x0 * in_stride_x];
                 } else {
-                    result[j] = (float)cval;
+                    v00 = (float)cval;
                 }
+                
+                /* Corner (y0, x0+1) */
+                if (y0 >= 0 && y0 < H && (x0+1) >= 0 && (x0+1) < W) {
+                    v01 = in_data[y0 * in_stride_y + (x0+1) * in_stride_x];
+                } else {
+                    v01 = (float)cval;
+                }
+                
+                /* Corner (y0+1, x0) */
+                if ((y0+1) >= 0 && (y0+1) < H && x0 >= 0 && x0 < W) {
+                    v10 = in_data[(y0+1) * in_stride_y + x0 * in_stride_x];
+                } else {
+                    v10 = (float)cval;
+                }
+                
+                /* Corner (y0+1, x0+1) */
+                if ((y0+1) >= 0 && (y0+1) < H && (x0+1) >= 0 && (x0+1) < W) {
+                    v11 = in_data[(y0+1) * in_stride_y + (x0+1) * in_stride_x];
+                } else {
+                    v11 = (float)cval;
+                }
+                
+                /* Bilinear interpolation */
+                result[j] = v00 * (1 - fx_val) * (1 - fy) +
+                           v01 * fx_val * (1 - fy) +
+                           v10 * (1 - fx_val) * fy +
+                           v11 * fx_val * fy;
             }
             
             /* Store results */
@@ -668,27 +716,44 @@ static int NI_ZoomShift_2D_bilinear_f32_simd(
             float x_src = ((float)ox + shift_x) / zoom_x;
             int x0 = (int)floor(x_src);
             
-            if (x0 >= 0 && x0 < W - 1) {
-                float fx = x_src - x0;
-                
-                npy_intp idx00 = y0 * in_stride_y + x0 * in_stride_x;
-                npy_intp idx01 = idx00 + in_stride_x;
-                npy_intp idx10 = idx00 + in_stride_y;
-                npy_intp idx11 = idx10 + in_stride_x;
-                
-                float v00 = in_data[idx00];
-                float v01 = in_data[idx01];
-                float v10 = in_data[idx10];
-                float v11 = in_data[idx11];
-                
-                out_row[ox * out_stride_x] = 
-                    v00 * (1 - fx) * (1 - fy) +
-                    v01 * fx * (1 - fy) +
-                    v10 * (1 - fx) * fy +
-                    v11 * fx * fy;
+            float fx = x_src - x0;
+            
+            /* Check bounds for each of the 4 corners and get values */
+            float v00, v01, v10, v11;
+            
+            /* Corner (y0, x0) */
+            if (y0 >= 0 && y0 < H && x0 >= 0 && x0 < W) {
+                v00 = in_data[y0 * in_stride_y + x0 * in_stride_x];
             } else {
-                out_row[ox * out_stride_x] = (float)cval;
+                v00 = (float)cval;
             }
+            
+            /* Corner (y0, x0+1) */
+            if (y0 >= 0 && y0 < H && (x0+1) >= 0 && (x0+1) < W) {
+                v01 = in_data[y0 * in_stride_y + (x0+1) * in_stride_x];
+            } else {
+                v01 = (float)cval;
+            }
+            
+            /* Corner (y0+1, x0) */
+            if ((y0+1) >= 0 && (y0+1) < H && x0 >= 0 && x0 < W) {
+                v10 = in_data[(y0+1) * in_stride_y + x0 * in_stride_x];
+            } else {
+                v10 = (float)cval;
+            }
+            
+            /* Corner (y0+1, x0+1) */
+            if ((y0+1) >= 0 && (y0+1) < H && (x0+1) >= 0 && (x0+1) < W) {
+                v11 = in_data[(y0+1) * in_stride_y + (x0+1) * in_stride_x];
+            } else {
+                v11 = (float)cval;
+            }
+                
+            out_row[ox * out_stride_x] = 
+                v00 * (1 - fx) * (1 - fy) +
+                v01 * fx * (1 - fy) +
+                v10 * (1 - fx) * fy +
+                v11 * fx * fy;
         }
     }
     
@@ -741,9 +806,10 @@ static int NI_GeometricTransform_2D_bilinear_f64_simd(
             __m128d vx = _mm_setr_pd((double)ox, (double)(ox+1));
             
             /* Compute source coordinates using affine transform (matrix * [oy, ox]) */
-            __m128d xs = _mm_add_pd(_mm_mul_pd(_mm_set1_pd(m01), vx),
+            /* Fix coordinate swap: xs should be column, ys should be row */
+            __m128d ys = _mm_add_pd(_mm_mul_pd(_mm_set1_pd(m01), vx),
                                     _mm_set1_pd(base_x));
-            __m128d ys = _mm_add_pd(_mm_mul_pd(_mm_set1_pd(m11), vx),
+            __m128d xs = _mm_add_pd(_mm_mul_pd(_mm_set1_pd(m11), vx),
                                     _mm_set1_pd(base_y));
             
             /* Floor to get integer coordinates - manual floor for SSE2 */
@@ -759,32 +825,45 @@ static int NI_GeometricTransform_2D_bilinear_f64_simd(
                 int x0 = (int)floor(x_src);
                 int y0 = (int)floor(y_src);
                 
-                /* Check if we're in the safe interior region */
-                if (x0 >= 0 && x0 < W - 1 && y0 >= 0 && y0 < H - 1) {
-                    double fx = x_src - x0;
-                    double fy = y_src - y0;
-                    
-                    /* Compute linear indices for the 4 corners */
-                    npy_intp idx00 = y0 * in_stride_y + x0 * in_stride_x;
-                    npy_intp idx01 = idx00 + in_stride_x;
-                    npy_intp idx10 = idx00 + in_stride_y;
-                    npy_intp idx11 = idx10 + in_stride_x;
-                    
-                    /* Load the 4 corner values */
-                    double v00 = in_data[idx00];
-                    double v01 = in_data[idx01];
-                    double v10 = in_data[idx10];
-                    double v11 = in_data[idx11];
-                    
-                    /* Bilinear interpolation */
-                    result[j] = v00 * (1 - fx) * (1 - fy) +
-                               v01 * fx * (1 - fy) +
-                               v10 * (1 - fx) * fy +
-                               v11 * fx * fy;
+                double fx = x_src - x0;
+                double fy = y_src - y0;
+                
+                /* Check bounds for each of the 4 corners individually */
+                double v00, v01, v10, v11;
+                
+                /* Corner (y0, x0) */
+                if (y0 >= 0 && y0 < H && x0 >= 0 && x0 < W) {
+                    v00 = in_data[y0 * in_stride_y + x0 * in_stride_x];
                 } else {
-                    /* Outside bounds - use cval or call scalar border handler */
-                    result[j] = cval;
+                    v00 = cval;
                 }
+                
+                /* Corner (y0, x0+1) */
+                if (y0 >= 0 && y0 < H && (x0+1) >= 0 && (x0+1) < W) {
+                    v01 = in_data[y0 * in_stride_y + (x0+1) * in_stride_x];
+                } else {
+                    v01 = cval;
+                }
+                
+                /* Corner (y0+1, x0) */
+                if ((y0+1) >= 0 && (y0+1) < H && x0 >= 0 && x0 < W) {
+                    v10 = in_data[(y0+1) * in_stride_y + x0 * in_stride_x];
+                } else {
+                    v10 = cval;
+                }
+                
+                /* Corner (y0+1, x0+1) */
+                if ((y0+1) >= 0 && (y0+1) < H && (x0+1) >= 0 && (x0+1) < W) {
+                    v11 = in_data[(y0+1) * in_stride_y + (x0+1) * in_stride_x];
+                } else {
+                    v11 = cval;
+                }
+                
+                /* Bilinear interpolation */
+                result[j] = v00 * (1 - fx) * (1 - fy) +
+                           v01 * fx * (1 - fy) +
+                           v10 * (1 - fx) * fy +
+                           v11 * fx * fy;
             }
             
             /* Store results */
@@ -794,34 +873,52 @@ static int NI_GeometricTransform_2D_bilinear_f64_simd(
         
         /* Scalar cleanup for remaining pixel */
         for (; ox < OW; ox++) {
-            double x_src = m01 * (double)ox + base_x;
-            double y_src = m11 * (double)ox + base_y;
+            /* Fix coordinate swap: x_src should be column, y_src should be row */
+            double y_src = m01 * (double)ox + base_x;
+            double x_src = m11 * (double)ox + base_y;
             
             int x0 = (int)floor(x_src);
             int y0 = (int)floor(y_src);
             
-            if (x0 >= 0 && x0 < W - 1 && y0 >= 0 && y0 < H - 1) {
-                double fx = x_src - x0;
-                double fy = y_src - y0;
-                
-                npy_intp idx00 = y0 * in_stride_y + x0 * in_stride_x;
-                npy_intp idx01 = idx00 + in_stride_x;
-                npy_intp idx10 = idx00 + in_stride_y;
-                npy_intp idx11 = idx10 + in_stride_x;
-                
-                double v00 = in_data[idx00];
-                double v01 = in_data[idx01];
-                double v10 = in_data[idx10];
-                double v11 = in_data[idx11];
-                
-                out_row[ox * out_stride_x] = 
-                    v00 * (1 - fx) * (1 - fy) +
-                    v01 * fx * (1 - fy) +
-                    v10 * (1 - fx) * fy +
-                    v11 * fx * fy;
+            double fx = x_src - x0;
+            double fy = y_src - y0;
+            
+            /* Check bounds for each of the 4 corners individually */
+            double v00, v01, v10, v11;
+            
+            /* Corner (y0, x0) */
+            if (y0 >= 0 && y0 < H && x0 >= 0 && x0 < W) {
+                v00 = in_data[y0 * in_stride_y + x0 * in_stride_x];
             } else {
-                out_row[ox * out_stride_x] = cval;
+                v00 = cval;
             }
+            
+            /* Corner (y0, x0+1) */
+            if (y0 >= 0 && y0 < H && (x0+1) >= 0 && (x0+1) < W) {
+                v01 = in_data[y0 * in_stride_y + (x0+1) * in_stride_x];
+            } else {
+                v01 = cval;
+            }
+            
+            /* Corner (y0+1, x0) */
+            if ((y0+1) >= 0 && (y0+1) < H && x0 >= 0 && x0 < W) {
+                v10 = in_data[(y0+1) * in_stride_y + x0 * in_stride_x];
+            } else {
+                v10 = cval;
+            }
+            
+            /* Corner (y0+1, x0+1) */
+            if ((y0+1) >= 0 && (y0+1) < H && (x0+1) >= 0 && (x0+1) < W) {
+                v11 = in_data[(y0+1) * in_stride_y + (x0+1) * in_stride_x];
+            } else {
+                v11 = cval;
+            }
+            
+            out_row[ox * out_stride_x] = 
+                v00 * (1 - fx) * (1 - fy) +
+                v01 * fx * (1 - fy) +
+                v10 * (1 - fx) * fy +
+                v11 * fx * fy;
         }
     }
     
@@ -839,6 +936,9 @@ static int NI_ZoomShift_2D_bilinear_f64_simd(
     const npy_intp W = PyArray_DIM(input, 1);
     const npy_intp OH = PyArray_DIM(output, 0);
     const npy_intp OW = PyArray_DIM(output, 1);
+    
+    /* Disable zoom SIMD - fallback to working scalar implementation */
+    return 0;
     const double* in_data = (const double*)PyArray_DATA(input);
     double* out_data = (double*)PyArray_DATA(output);
     const npy_intp in_stride_y = PyArray_STRIDE(input, 0) / sizeof(double);
@@ -875,8 +975,8 @@ static int NI_ZoomShift_2D_bilinear_f64_simd(
         int y0 = (int)floor(y_src);
         double fy = y_src - y0;
         
-        /* Skip this row if outside bounds */
-        if (y0 < 0 || y0 >= H - 1) {
+        /* Skip this row if completely outside bounds - allow edge interpolation */
+        if (y0 < 0 || y0 >= H) {
             for (npy_intp ox = 0; ox < OW; ox++) {
                 out_row[ox * out_stride_x] = cval;
             }
@@ -901,26 +1001,38 @@ static int NI_ZoomShift_2D_bilinear_f64_simd(
                 double xs = x_src_arr[j];
                 int x0 = (int)floor(xs);
                 
+                double fx = xs - x0;
+                
+                /* Simplified zoom boundary check */
                 if (x0 >= 0 && x0 < W - 1) {
-                    double fx = xs - x0;
-                    
-                    /* Load the 4 corner values */
+                    /* Can safely do bilinear in x direction */
                     npy_intp idx00 = y0 * in_stride_y + x0 * in_stride_x;
                     npy_intp idx01 = idx00 + in_stride_x;
-                    npy_intp idx10 = idx00 + in_stride_y;
-                    npy_intp idx11 = idx10 + in_stride_x;
                     
                     double v00 = in_data[idx00];
                     double v01 = in_data[idx01];
-                    double v10 = in_data[idx10];
-                    double v11 = in_data[idx11];
                     
-                    /* Bilinear interpolation */
-                    result[j] = v00 * (1 - fx) * (1 - fy) +
-                               v01 * fx * (1 - fy) +
-                               v10 * (1 - fx) * fy +
-                               v11 * fx * fy;
+                    if (y0 < H - 1) {
+                        /* Can safely access y0+1 */
+                        npy_intp idx10 = idx00 + in_stride_y;
+                        npy_intp idx11 = idx10 + in_stride_x;
+                        
+                        double v10 = in_data[idx10];
+                        double v11 = in_data[idx11];
+                        
+                        result[j] = v00 * (1 - fx) * (1 - fy) +
+                                   v01 * fx * (1 - fy) +
+                                   v10 * (1 - fx) * fy +
+                                   v11 * fx * fy;
+                    } else {
+                        /* y0 is last row, use y0 values with y0+1=cval */
+                        result[j] = v00 * (1 - fx) * (1 - fy) +
+                                   v01 * fx * (1 - fy) +
+                                   cval * (1 - fx) * fy +
+                                   cval * fx * fy;
+                    }
                 } else {
+                    /* x boundary case or out of bounds */
                     result[j] = cval;
                 }
             }
@@ -935,25 +1047,40 @@ static int NI_ZoomShift_2D_bilinear_f64_simd(
             double x_src = ((double)ox + shift_x) / zoom_x;
             int x0 = (int)floor(x_src);
             
+            double fx = x_src - x0;
+            
+            /* Simplified zoom boundary check for scalar cleanup */
             if (x0 >= 0 && x0 < W - 1) {
-                double fx = x_src - x0;
-                
+                /* Can safely do bilinear in x direction */
                 npy_intp idx00 = y0 * in_stride_y + x0 * in_stride_x;
                 npy_intp idx01 = idx00 + in_stride_x;
-                npy_intp idx10 = idx00 + in_stride_y;
-                npy_intp idx11 = idx10 + in_stride_x;
                 
                 double v00 = in_data[idx00];
                 double v01 = in_data[idx01];
-                double v10 = in_data[idx10];
-                double v11 = in_data[idx11];
                 
-                out_row[ox * out_stride_x] = 
-                    v00 * (1 - fx) * (1 - fy) +
-                    v01 * fx * (1 - fy) +
-                    v10 * (1 - fx) * fy +
-                    v11 * fx * fy;
+                if (y0 < H - 1) {
+                    /* Can safely access y0+1 */
+                    npy_intp idx10 = idx00 + in_stride_y;
+                    npy_intp idx11 = idx10 + in_stride_x;
+                    
+                    double v10 = in_data[idx10];
+                    double v11 = in_data[idx11];
+                    
+                    out_row[ox * out_stride_x] = 
+                        v00 * (1 - fx) * (1 - fy) +
+                        v01 * fx * (1 - fy) +
+                        v10 * (1 - fx) * fy +
+                        v11 * fx * fy;
+                } else {
+                    /* y0 is last row, use y0 values with y0+1=cval */
+                    out_row[ox * out_stride_x] = 
+                        v00 * (1 - fx) * (1 - fy) +
+                        v01 * fx * (1 - fy) +
+                        cval * (1 - fx) * fy +
+                        cval * fx * fy;
+                }
             } else {
+                /* x boundary case or out of bounds */
                 out_row[ox * out_stride_x] = cval;
             }
         }
