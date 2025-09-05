@@ -42,11 +42,11 @@ int NI_GeometricTransform_2D_bilinear_f64_avx2(
     if (H < 2 || W < 2) return 0;
     if (H > INT_MAX - 1 || W > INT_MAX - 1) return 0;  /* Prevent int overflow */
 
-    /* Matrix and shift as doubles */
-    const double m00 = M[0], m01 = M[1];
-    const double m10 = M[2], m11 = M[3];
-    const double sx = shift[0] + nprepad;
-    const double sy = shift[1] + nprepad;
+    /* Matrix and shift as doubles - SciPy axis convention */
+    const double m00 = M[0], m01 = M[1];         /* contributes to y_src (axis 0) */
+    const double m10 = M[2], m11 = M[3];         /* contributes to x_src (axis 1) */
+    const double shy = shift[0] + nprepad;       /* shift for rows (y) */
+    const double shx = shift[1] + nprepad;       /* shift for cols (x) */
 
     const __m256d one = _mm256_set1_pd(1.0);
 
@@ -54,9 +54,9 @@ int NI_GeometricTransform_2D_bilinear_f64_avx2(
     for (npy_intp oy = 0; oy < OH; ++oy) {
         double* out_row = out_data + oy * out_stride_y;
 
-        /* Base source coordinates for this row (SciPy: matrix * [oy, ox]) */
-        double base_x = m00 * (double)oy + m01 * 0 + sx;
-        double base_y = m10 * (double)oy + m11 * 0 + sy;
+        /* SciPy: y_src uses row 0 of M + shift[0]; x_src uses row 1 + shift[1] */
+        const double base_y = m00 * (double)oy + shy;  /* y_src base */
+        const double base_x = m10 * (double)oy + shx;  /* x_src base */
 
         npy_intp ox = 0;
 
@@ -66,11 +66,11 @@ int NI_GeometricTransform_2D_bilinear_f64_avx2(
             __m256d vx = _mm256_setr_pd((double)ox, (double)(ox+1),
                                         (double)(ox+2), (double)(ox+3));
 
-            /* Compute source coordinates using affine transform (matrix * [oy, ox]) */
-            __m256d xs = _mm256_fmadd_pd(_mm256_set1_pd(m01), vx,
-                                         _mm256_set1_pd(base_x));
-            __m256d ys = _mm256_fmadd_pd(_mm256_set1_pd(m11), vx,
-                                         _mm256_set1_pd(base_y));
+            /* Compute source coordinates using SciPy axis convention */
+            __m256d ys = _mm256_fmadd_pd(_mm256_set1_pd(m01), vx,
+                                         _mm256_set1_pd(base_y)); /* y_src */
+            __m256d xs = _mm256_fmadd_pd(_mm256_set1_pd(m11), vx,
+                                         _mm256_set1_pd(base_x)); /* x_src */
 
             /* Floor to get integer coordinates */
             __m256d x_floor = _mm256_floor_pd(xs);
@@ -115,36 +115,43 @@ int NI_GeometricTransform_2D_bilinear_f64_avx2(
                 int x0 = xi_arr[j];
                 int y0 = yi_arr[j];
 
-                /* Check if we're in the safe interior region */
-                if (x0 >= 0 && x0 < W - 1 && y0 >= 0 && y0 < H - 1) {
-                    /* Compute linear indices for the 4 corners */
-                    npy_intp idx00 = y0 * in_stride_y + x0 * in_stride_x;
-                    npy_intp idx01 = idx00 + in_stride_x;
-                    npy_intp idx10 = idx00 + in_stride_y;
-                    npy_intp idx11 = idx10 + in_stride_x;
-
-                    /* Prefetch further ahead along x (16-32 doubles = 128-256 bytes ahead) */
-                    #if USE_PREFETCH
-                    const int PX = 16;  /* Tunable: try 16 or 32 */
-                    if (x0 + PX < W - 1) {
-                        _mm_prefetch((const char*)(in_data + idx00 + PX * in_stride_x), _MM_HINT_T0);
-                        _mm_prefetch((const char*)(in_data + idx10 + PX * in_stride_x), _MM_HINT_T0);
-                    }
-                    #endif
-
-                    /* Load the 4 corner values */
-                    double v00 = in_data[idx00];
-                    double v01 = in_data[idx01];
-                    double v10 = in_data[idx10];
-                    double v11 = in_data[idx11];
-
-                    /* Bilinear interpolation using precomputed weights */
-                    result[j] = v00 * w00_arr[j] + v01 * w01_arr[j] +
-                               v10 * w10_arr[j] + v11 * w11_arr[j];
+                /* Bilinear interpolation with correct axis convention */
+                /* x0 is column index, y0 is row index */
+                
+                /* Check bounds for each of the 4 corners and get values */
+                double v00, v01, v10, v11;
+                
+                /* Corner (y0, x0) - row y0, col x0 */
+                if (y0 >= 0 && y0 < H && x0 >= 0 && x0 < W) {
+                    v00 = in_data[y0 * in_stride_y + x0 * in_stride_x];
                 } else {
-                    /* Outside bounds - use cval */
-                    result[j] = cval;
+                    v00 = cval;
                 }
+                
+                /* Corner (y0, x0+1) - row y0, col x0+1 */
+                if (y0 >= 0 && y0 < H && (x0+1) >= 0 && (x0+1) < W) {
+                    v01 = in_data[y0 * in_stride_y + (x0+1) * in_stride_x];
+                } else {
+                    v01 = cval;
+                }
+                
+                /* Corner (y0+1, x0) - row y0+1, col x0 */
+                if ((y0+1) >= 0 && (y0+1) < H && x0 >= 0 && x0 < W) {
+                    v10 = in_data[(y0+1) * in_stride_y + x0 * in_stride_x];
+                } else {
+                    v10 = cval;
+                }
+                
+                /* Corner (y0+1, x0+1) - row y0+1, col x0+1 */
+                if ((y0+1) >= 0 && (y0+1) < H && (x0+1) >= 0 && (x0+1) < W) {
+                    v11 = in_data[(y0+1) * in_stride_y + (x0+1) * in_stride_x];
+                } else {
+                    v11 = cval;
+                }
+
+                /* Bilinear interpolation using precomputed weights */
+                result[j] = v00 * w00_arr[j] + v01 * w01_arr[j] +
+                           v10 * w10_arr[j] + v11 * w11_arr[j];
             }
 
             /* Store results */
@@ -154,34 +161,52 @@ int NI_GeometricTransform_2D_bilinear_f64_avx2(
 
         /* Scalar cleanup for remaining pixels */
         for (; ox < OW; ox++) {
-            double x_src = m01 * (double)ox + base_x;
-            double y_src = m11 * (double)ox + base_y;
+            /* Scalar cleanup with correct SciPy axis convention */
+            double y_src = m01 * (double)ox + base_y;   /* rows */
+            double x_src = m11 * (double)ox + base_x;   /* cols */
 
-            int x0 = (int)floor(x_src);
-            int y0 = (int)floor(y_src);
+            int x0 = (int)floor(x_src);  // column index
+            int y0 = (int)floor(y_src);  // row index
 
-            if (x0 >= 0 && x0 < W - 1 && y0 >= 0 && y0 < H - 1) {
-                double fx = x_src - x0;
-                double fy = y_src - y0;
+            double fx = x_src - x0;
+            double fy = y_src - y0;
 
-                npy_intp idx00 = y0 * in_stride_y + x0 * in_stride_x;
-                npy_intp idx01 = idx00 + in_stride_x;
-                npy_intp idx10 = idx00 + in_stride_y;
-                npy_intp idx11 = idx10 + in_stride_x;
-
-                double v00 = in_data[idx00];
-                double v01 = in_data[idx01];
-                double v10 = in_data[idx10];
-                double v11 = in_data[idx11];
-
-                out_row[ox * out_stride_x] =
-                    v00 * (1 - fx) * (1 - fy) +
-                    v01 * fx * (1 - fy) +
-                    v10 * (1 - fx) * fy +
-                    v11 * fx * fy;
+            /* Check bounds for each of the 4 corners and get values */
+            double v00, v01, v10, v11;
+            
+            /* Corner (y0, x0) - row y0, col x0 */
+            if (y0 >= 0 && y0 < H && x0 >= 0 && x0 < W) {
+                v00 = in_data[y0 * in_stride_y + x0 * in_stride_x];
             } else {
-                out_row[ox * out_stride_x] = cval;
+                v00 = cval;
             }
+            
+            /* Corner (y0, x0+1) - row y0, col x0+1 */
+            if (y0 >= 0 && y0 < H && (x0+1) >= 0 && (x0+1) < W) {
+                v01 = in_data[y0 * in_stride_y + (x0+1) * in_stride_x];
+            } else {
+                v01 = cval;
+            }
+            
+            /* Corner (y0+1, x0) - row y0+1, col x0 */
+            if ((y0+1) >= 0 && (y0+1) < H && x0 >= 0 && x0 < W) {
+                v10 = in_data[(y0+1) * in_stride_y + x0 * in_stride_x];
+            } else {
+                v10 = cval;
+            }
+            
+            /* Corner (y0+1, x0+1) - row y0+1, col x0+1 */
+            if ((y0+1) >= 0 && (y0+1) < H && (x0+1) >= 0 && (x0+1) < W) {
+                v11 = in_data[(y0+1) * in_stride_y + (x0+1) * in_stride_x];
+            } else {
+                v11 = cval;
+            }
+
+            out_row[ox * out_stride_x] =
+                v00 * (1 - fx) * (1 - fy) +
+                v01 * fx * (1 - fy) +
+                v10 * (1 - fx) * fy +
+                v11 * fx * fy;
         }
     }
 
@@ -432,11 +457,11 @@ int NI_GeometricTransform_2D_bilinear_f32_avx2(
     if (H < 2 || W < 2) return 0;
     if (H > INT_MAX - 1 || W > INT_MAX - 1) return 0;  /* Prevent int overflow */
 
-    /* Matrix and shift as floats */
-    const float m00 = (float)M[0], m01 = (float)M[1];
-    const float m10 = (float)M[2], m11 = (float)M[3];
-    const float sx = (float)(shift[0] + nprepad);
-    const float sy = (float)(shift[1] + nprepad);
+    /* Matrix and shift as floats - SciPy axis convention */
+    const float m00 = (float)M[0], m01 = (float)M[1];         /* contributes to y_src (axis 0) */
+    const float m10 = (float)M[2], m11 = (float)M[3];         /* contributes to x_src (axis 1) */
+    const float shy = (float)(shift[0] + nprepad);             /* shift for rows (y) */
+    const float shx = (float)(shift[1] + nprepad);             /* shift for cols (x) */
 
     const __m256 one = _mm256_set1_ps(1.0f);
 
@@ -444,9 +469,9 @@ int NI_GeometricTransform_2D_bilinear_f32_avx2(
     for (npy_intp oy = 0; oy < OH; ++oy) {
         float* out_row = out_data + oy * out_stride_y;
 
-        /* Base source coordinates for this row (SciPy: matrix * [oy, ox]) */
-        float base_x = m00 * (float)oy + m01 * 0 + sx;
-        float base_y = m10 * (float)oy + m11 * 0 + sy;
+        /* SciPy: y_src uses row 0 of M + shift[0]; x_src uses row 1 + shift[1] */
+        const float base_y = m00 * (float)oy + shy;  /* y_src base */
+        const float base_x = m10 * (float)oy + shx;  /* x_src base */
 
         npy_intp ox = 0;
 
@@ -456,9 +481,9 @@ int NI_GeometricTransform_2D_bilinear_f32_avx2(
             __m256 vx = _mm256_setr_ps((float)ox, (float)(ox+1), (float)(ox+2), (float)(ox+3),
                                        (float)(ox+4), (float)(ox+5), (float)(ox+6), (float)(ox+7));
 
-            /* Compute source coordinates using affine transform (matrix * [oy, ox]) */
-            __m256 xs = _mm256_fmadd_ps(_mm256_set1_ps(m01), vx, _mm256_set1_ps(base_x));
-            __m256 ys = _mm256_fmadd_ps(_mm256_set1_ps(m11), vx, _mm256_set1_ps(base_y));
+            /* Compute source coordinates using SciPy axis convention */
+            __m256 ys = _mm256_fmadd_ps(_mm256_set1_ps(m01), vx, _mm256_set1_ps(base_y)); /* y_src */
+            __m256 xs = _mm256_fmadd_ps(_mm256_set1_ps(m11), vx, _mm256_set1_ps(base_x)); /* x_src */
 
             /* Floor to get integer coordinates */
             __m256 x_floor = _mm256_floor_ps(xs);
@@ -498,36 +523,56 @@ int NI_GeometricTransform_2D_bilinear_f32_avx2(
 
             SCIPY_ALIGN(32) float result[8];
 
-            /* Process each pixel */
+            /* Process each pixel - with bounds checking */
             for (int j = 0; j < 8; j++) {
                 int x0 = xi_arr[j];
                 int y0 = yi_arr[j];
 
-                if (x0 >= 0 && x0 < W - 1 && y0 >= 0 && y0 < H - 1) {
-                    npy_intp idx00 = y0 * in_stride_y + x0 * in_stride_x;
-                    npy_intp idx01 = idx00 + in_stride_x;
-                    npy_intp idx10 = idx00 + in_stride_y;
-                    npy_intp idx11 = idx10 + in_stride_x;
+                /* Check bounds for each of the 4 corners individually */
+                float v00, v01, v10, v11;
 
-                    /* Prefetch further ahead along x (32 floats = 128 bytes ahead) */
-                    #if USE_PREFETCH
-                    const int PX = 32;  /* Tunable: try 16-64 */
-                    if (x0 + PX < W - 1) {
-                        _mm_prefetch((const char*)(in_data + idx00 + PX * in_stride_x), _MM_HINT_T0);
-                        _mm_prefetch((const char*)(in_data + idx10 + PX * in_stride_x), _MM_HINT_T0);
-                    }
-                    #endif
-
-                    float v00 = in_data[idx00];
-                    float v01 = in_data[idx01];
-                    float v10 = in_data[idx10];
-                    float v11 = in_data[idx11];
-
-                    result[j] = v00 * w00_arr[j] + v01 * w01_arr[j] +
-                               v10 * w10_arr[j] + v11 * w11_arr[j];
+                /* Corner (x0, y0) - row x0, col y0 */
+                if (x0 >= 0 && x0 < H && y0 >= 0 && y0 < W) {
+                    v00 = in_data[x0 * in_stride_y + y0 * in_stride_x];
                 } else {
-                    result[j] = (float)cval;
+                    v00 = (float)cval;
                 }
+
+                /* Corner (x0, y0+1) - row x0, col y0+1 */
+                if (x0 >= 0 && x0 < H && (y0+1) >= 0 && (y0+1) < W) {
+                    v01 = in_data[x0 * in_stride_y + (y0+1) * in_stride_x];
+                } else {
+                    v01 = (float)cval;
+                }
+
+                /* Corner (x0+1, y0) - row x0+1, col y0 */
+                if ((x0+1) >= 0 && (x0+1) < H && y0 >= 0 && y0 < W) {
+                    v10 = in_data[(x0+1) * in_stride_y + y0 * in_stride_x];
+                } else {
+                    v10 = (float)cval;
+                }
+
+                /* Corner (x0+1, y0+1) - row x0+1, col y0+1 */
+                if ((x0+1) >= 0 && (x0+1) < H && (y0+1) >= 0 && (y0+1) < W) {
+                    v11 = in_data[(x0+1) * in_stride_y + (y0+1) * in_stride_x];
+                } else {
+                    v11 = (float)cval;
+                }
+
+                /* Prefetch further ahead along x (32 floats = 128 bytes ahead) */
+                #if USE_PREFETCH
+                const int PX = 32;  /* Tunable: try 16-64 */
+                if (x0 >= 0 && x0 + PX < W && y0 >= 0 && y0 < H) {
+                    _mm_prefetch((const char*)(in_data + y0 * in_stride_y + (x0 + PX) * in_stride_x), _MM_HINT_T0);
+                    if (y0 + 1 < H) {
+                        _mm_prefetch((const char*)(in_data + (y0+1) * in_stride_y + (x0 + PX) * in_stride_x), _MM_HINT_T0);
+                    }
+                }
+                #endif
+
+                /* Bilinear interpolation using precomputed weights */
+                result[j] = v00 * w00_arr[j] + v01 * w01_arr[j] +
+                           v10 * w10_arr[j] + v11 * w11_arr[j];
             }
 
             /* Store results */
@@ -537,34 +582,52 @@ int NI_GeometricTransform_2D_bilinear_f32_avx2(
 
         /* Scalar cleanup */
         for (; ox < OW; ox++) {
-            float x_src = m01 * (float)ox + base_x;
-            float y_src = m11 * (float)ox + base_y;
+            /* Scalar cleanup with correct SciPy axis convention */
+            float y_src = m01 * (float)ox + base_y;   /* rows */
+            float x_src = m11 * (float)ox + base_x;   /* cols */
 
-            int x0 = (int)floorf(x_src);
-            int y0 = (int)floorf(y_src);
+            int x0 = (int)floorf(x_src);  // column index
+            int y0 = (int)floorf(y_src);  // row index
 
-            if (x0 >= 0 && x0 < W - 1 && y0 >= 0 && y0 < H - 1) {
-                float fx = x_src - x0;
-                float fy = y_src - y0;
+            float fx = x_src - x0;
+            float fy = y_src - y0;
 
-                npy_intp idx00 = y0 * in_stride_y + x0 * in_stride_x;
-                npy_intp idx01 = idx00 + in_stride_x;
-                npy_intp idx10 = idx00 + in_stride_y;
-                npy_intp idx11 = idx10 + in_stride_x;
-
-                float v00 = in_data[idx00];
-                float v01 = in_data[idx01];
-                float v10 = in_data[idx10];
-                float v11 = in_data[idx11];
-
-                out_row[ox * out_stride_x] =
-                    v00 * (1 - fx) * (1 - fy) +
-                    v01 * fx * (1 - fy) +
-                    v10 * (1 - fx) * fy +
-                    v11 * fx * fy;
+            /* Check bounds for each of the 4 corners individually */
+            float v00, v01, v10, v11;
+            
+            /* Corner (y0, x0) */
+            if (y0 >= 0 && y0 < H && x0 >= 0 && x0 < W) {
+                v00 = in_data[y0 * in_stride_y + x0 * in_stride_x];
             } else {
-                out_row[ox * out_stride_x] = (float)cval;
+                v00 = (float)cval;
             }
+            
+            /* Corner (y0, x0+1) */
+            if (y0 >= 0 && y0 < H && (x0+1) >= 0 && (x0+1) < W) {
+                v01 = in_data[y0 * in_stride_y + (x0+1) * in_stride_x];
+            } else {
+                v01 = (float)cval;
+            }
+            
+            /* Corner (y0+1, x0) */
+            if ((y0+1) >= 0 && (y0+1) < H && x0 >= 0 && x0 < W) {
+                v10 = in_data[(y0+1) * in_stride_y + x0 * in_stride_x];
+            } else {
+                v10 = (float)cval;
+            }
+            
+            /* Corner (y0+1, x0+1) */
+            if ((y0+1) >= 0 && (y0+1) < H && (x0+1) >= 0 && (x0+1) < W) {
+                v11 = in_data[(y0+1) * in_stride_y + (x0+1) * in_stride_x];
+            } else {
+                v11 = (float)cval;
+            }
+
+            out_row[ox * out_stride_x] =
+                v00 * (1 - fx) * (1 - fy) +
+                v01 * fx * (1 - fy) +
+                v10 * (1 - fx) * fy +
+                v11 * fx * fy;
         }
     }
 
